@@ -2,8 +2,9 @@ import { spawn } from 'child_process';
 import { promises as dns } from 'dns';
 import * as fs from 'fs';
 import * as net from 'net';
+import { isIPv4 } from 'node:net';
 import { ServerInstance } from './common';
-import { clusters } from './env';
+import { clusters, debugLog } from './env';
 
 export interface BackendServerInstance extends ServerInstance {
     state: string;
@@ -110,12 +111,15 @@ export function startHAProxy() {
 }
 
 function mapState(stateNumber: string) {
-    switch(stateNumber) {
-        case '0': return 'maint';
-        case '1': return 'drain';
-        case '2': return 'ready';
+    switch (stateNumber) {
+        case '0':
+            return 'maint';
+        case '1':
+            return 'drain';
+        case '2':
+            return 'ready';
         default: {
-            console.warn(`Received unknown backend server state number '${stateNumber}'`);
+            console.warn(`Received unknown backend server state number '${ stateNumber }'`);
             return 'unknown';
         }
     }
@@ -125,28 +129,35 @@ export async function getBackendServers(name: string) {
     const showServersCmd = `show servers state ${ name }_backend`;
     const existingServersOutput = await sendCommandToHAProxy(showServersCmd);
     const existingServers: BackendServerInstance[] = existingServersOutput.split('\n').slice(2)
-                                                                   .filter(x => x.length > 0)
-                                                                   .map(x => x.split(' '))
-                                                                   .map(x => ({
-                                                                       host: x[3],
-                                                                       port: parseInt(x[18]),
-                                                                       state: mapState(x[5])
-                                                                   }));
+                                                                          .filter(x => x.length > 0)
+                                                                          .map(x => x.split(' '))
+                                                                          .map(x => ({
+                                                                              host: x[3],
+                                                                              port: parseInt(x[18]),
+                                                                              state: mapState(x[5])
+                                                                          }));
+
+    if (debugLog) {
+        console.debug(`Backend servers of '${ name }':\nraw result:\n\n${ existingServersOutput }\n\nparsed result:\n`,
+            existingServers);
+    }
 
     return existingServers;
 }
 
 export async function addServerToBackend(name: string, server: ServerInstance) {
     let ips: string[] = [];
-    try {
-        ips = await dns.resolve(server.host);
-        if (!ips.length) {
-            throw new Error('No IP address found');
+    if(isIPv4(server.host)) {
+        ips.push(server.host);
+    } else {
+        try {
+            ips = await dns.resolve(server.host);
+            if (!ips.length) {
+                throw new Error('No IP address found');
+            }
+        } catch (e) {
+            throw new Error(`Couldn't get IP address of '${ server.host }'`, { cause: e });
         }
-    } catch (e) {
-        console.error(`Couldn't get IP address of '${ server.host }'`, e);
-
-        throw e;
     }
     const cmd = `add server ${ name }_backend/${ server.host } ${ ips[0] }:${ server.port }`;
     await sendCommandToHAProxy(cmd);

@@ -1,6 +1,6 @@
 import Redis from 'ioredis';
-import { ServerInstance } from './common';
-import { clusters } from './env';
+import { ServerInstance, sleep } from './common';
+import { debugLog } from './env';
 
 export class SentinelClient {
     commandClient: Redis | undefined;
@@ -66,12 +66,13 @@ export class SentinelClient {
             onConnectCallback(redisClient);
         });
 
-        redisClient.on('end', () => {
+        redisClient.on('end', async () => {
             if (!reconnecting) {
                 onDisconnectCallback();
                 reconnecting = true;
                 console.warn(`[${ name }] Connection to sentinel '${ instance.host }:${ instance.port }' ended.`);
                 redisClient.removeAllListeners();
+                await sleep(5000)
                 this.internalConnect(name,
                     (currentInstanceIndex + 1) % this.instances.length,
                     onConnectCallback,
@@ -93,21 +94,30 @@ export interface ClusterInfo {
     replicas: ServerInstance[];
 }
 
-export async function getRedisClustersFromSentinel(client: Redis) {
+export async function getRedisClustersFromSentinel(client: Redis, clusters: string[]) {
     const result: ClusterInfo[] = [];
 
-    for (const { name } of clusters) {
+    for (const name of clusters) {
         try {
             const masterResult = await client.call('sentinel',
                 'get-master-addr-by-name',
                 name) as string[];
-            const replicasResult = await client.call('sentinel', 'replicas', name) as string[][];
+            const replicasResult = sentinelResultToObjects(await client.call('sentinel',
+                'replicas',
+                name) as string[][]);
+
+            if(debugLog) {
+                console.debug(`Master of cluster '${name}':`, masterResult);
+                console.debug(`Replicas of cluster '${name}': `, replicasResult)
+            }
 
             const cluster = {
                 name,
                 master: { host: masterResult[0], port: parseInt(masterResult[1]) },
-                replicas: replicasResult.map(x => ({ host: x[3], port: parseInt(x[5]) }))
+                replicas: replicasResult.filter(x => x.flags.indexOf('s_down') === -1)
+                                        .map(x => ({ host: x.ip, port: parseInt(x.port) }))
             };
+
             result.push(cluster);
         } catch (e) {
             console.warn(`Couldn't get cluster info from sentinel for '${ name }'`, e);
@@ -115,4 +125,15 @@ export async function getRedisClustersFromSentinel(client: Redis) {
     }
 
     return result;
+}
+
+function sentinelResultToObjects(result: string[][]): { [k: string]: string }[] {
+    return result.reduce<Record<string, string>[]>((acc, curr) => {
+        const o: { [k: string]: string } = {};
+        for (let i = 0; i < curr.length; i += 2) {
+            o[curr[i]] = curr[i + 1];
+        }
+        acc.push(o);
+        return acc;
+    }, []);
 }

@@ -19,11 +19,11 @@ function hostMatcher(a: ServerInstance, b: ServerInstance) {
     return a.host === b.host && a.port === b.port;
 }
 
-async function updateServersInHAProxy(client: Redis) {
+async function updateServersInHAProxy(client: Redis, clusters: string[]) {
     const release = await mutex.acquire();
     try {
-        const clusters = await getRedisClustersFromSentinel(client);
-        for (const cluster of clusters) {
+        const clusterInfos = await getRedisClustersFromSentinel(client, clusters);
+        for (const cluster of clusterInfos) {
             const clusterServers = [ cluster.master, ...cluster.replicas ];
             const existingServers = await getBackendServers(cluster.name);
 
@@ -41,9 +41,13 @@ async function updateServersInHAProxy(client: Redis) {
                     removedServers.map(x => `${ x.host }:${ x.port }`).join(', ') }`);
             }
 
-
             for (const newServer of newServers) {
-                await addServerToBackend(cluster.name, newServer);
+                try {
+                    await addServerToBackend(cluster.name, newServer);
+                } catch (e) {
+                    console.warn(`Couldn't add server '${ newServer.host }:${ newServer.port }' to backend '${ cluster.name }_backend'`,
+                        e);
+                }
             }
 
             for (const removedServer of removedServers) {
@@ -54,6 +58,7 @@ async function updateServersInHAProxy(client: Redis) {
                 await setServerState(cluster.name, cluster.master.host, 'ready');
             }
 
+            await setServerState(cluster.name, cluster.master.host, 'ready');
             for (const replica of cluster.replicas) {
                 if (existingServers.filter(x => hostMatcher(x, replica))[0]?.state === 'ready') {
                     await setServerState(cluster.name, replica.host, 'maint');
@@ -66,8 +71,8 @@ async function updateServersInHAProxy(client: Redis) {
     }
 }
 
-async function slavesChanged(message: string, commandClient: Redis) {
-    await updateServersInHAProxy(commandClient);
+async function slavesChanged(clusters: string[], message: string, commandClient: Redis) {
+    await updateServersInHAProxy(commandClient, clusters);
 }
 
 async function masterSwitched(message: string) {
@@ -83,15 +88,17 @@ async function main() {
     startHAProxy();
     await new Promise(resolve => setTimeout(resolve, 1000));
 
-    const sentinelClient = new SentinelClient(sentinels);
-    sentinelClient.connect(
-        commandClient => updateServersInHAProxy(commandClient),
-        {
-            '+switch-master': masterSwitched,
-            '+slave': slavesChanged,
-            '-slave': slavesChanged
-        }
-    );
+    for (const [ name, clusterSentinels ] of Object.entries(sentinels)) {
+        const sentinelClient = new SentinelClient(clusterSentinels);
+        sentinelClient.connect(
+            commandClient => updateServersInHAProxy(commandClient, [ name ]),
+            {
+                '+switch-master': masterSwitched,
+                '+slave': (m, c) => slavesChanged([ name ], m, c),
+                '-slave': (m, c) => slavesChanged([ name ], m, c)
+            }
+        );
+    }
 }
 
 main().catch((err) => {
